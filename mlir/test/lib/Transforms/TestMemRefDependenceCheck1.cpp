@@ -67,38 +67,279 @@ getDirectionVectorStr(bool ret, unsigned numCommonLoops, unsigned loopNestDepth,
   return result;
 }
 
-// For each access in 'loadsAndStores', runs a dependence check between this
-// "source" access and all subsequent "destination" accesses in
-// 'loadsAndStores'. Emits the result of the dependence check as a note with
-// the source access.
-static void checkDependences(ArrayRef<Operation *> loadsAndStores) {
-  for (unsigned i = 0, e = loadsAndStores.size(); i < e; ++i) {
-    auto *srcOpInst = loadsAndStores[i];
-    MemRefAccess srcAccess(srcOpInst);
-    for (unsigned j = 0; j < e; ++j) {
-      auto *dstOpInst = loadsAndStores[j];
-      MemRefAccess dstAccess(dstOpInst);
+// Computes the iteration domain for 'opInst' and populates 'indexSet', which
+// encapsulates the constraints involving loops surrounding 'opInst' and
+// potentially involving any Function symbols. The dimensional identifiers in
+// 'indexSet' correspond to the loops surrounding 'op' from outermost to
+// innermost.
+// TODO(andydavis) Add support to handle IfInsts surrounding 'op'.
+static LogicalResult getInstIndexSet(Operation *op,
+                                     FlatAffineConstraints *indexSet) {
+  // TODO(andydavis) Extend this to gather enclosing IfInsts and consider
+  // factoring it out into a utility function.
+  SmallVector<AffineForOp, 4> loops;
+  getLoopIVs(*op, &loops);
+  return getIndexSet(loops, indexSet);
+}
 
-      unsigned numCommonLoops =
-          getNumCommonSurroundingLoops(*srcOpInst, *dstOpInst);
-      for (unsigned d = 1; d <= numCommonLoops + 1; ++d) {
-        FlatAffineConstraints dependenceConstraints;
-        SmallVector<DependenceComponent, 2> dependenceComponents;
-        DependenceResult result = checkMemrefAccessDependence(
-            srcAccess, dstAccess, d, &dependenceConstraints,
-            &dependenceComponents);
-        assert(result.value != DependenceResult::Failure);
-        bool ret = hasDependence(result);
-        // TODO(andydavis) Print dependence type (i.e. RAW, etc) and print
-        // distance vectors as: ([2, 3], [0, 10]). Also, shorten distance
-        // vectors from ([1, 1], [3, 3]) to (1, 3).
-        srcOpInst->emitRemark("dependence from ")
-            << i << " to " << j << " at depth " << d << " = "
-            << getDirectionVectorStr(ret, numCommonLoops, d,
-                                     dependenceComponents);
+
+
+// ValuePositionMap manages the mapping from Values which represent dimension
+// and symbol identifiers from 'src' and 'dst' access functions to positions
+// in new space where some Values are kept separate (using addSrc/DstValue)
+// and some Values are merged (addSymbolValue).
+// Position lookups return the absolute position in the new space which
+// has the following format:
+//
+//   [src-dim-identifiers] [dst-dim-identifiers] [symbol-identifiers]
+//
+// Note: access function non-IV dimension identifiers (that have 'dimension'
+// positions in the access function position space) are assigned as symbols
+// in the output position space. Convenience access functions which lookup
+// an Value in multiple maps are provided (i.e. getSrcDimOrSymPos) to handle
+// the common case of resolving positions for all access function operands.
+//
+// TODO(andydavis) Generalize this: could take a template parameter for
+// the number of maps (3 in the current case), and lookups could take indices
+// of maps to check. So getSrcDimOrSymPos would be "getPos(value, {0, 2})".
+class ValuePositionMap1 {
+public:
+  void addSrcValue(Value value) {
+    if (addValueAt(value, &srcDimPosMap, numSrcDims))
+      ++numSrcDims;
+  }
+  void addSymbolValue(Value value) {
+    if (addValueAt(value, &symbolPosMap, numSymbols))
+      ++numSymbols;
+  }
+  unsigned getSrcDimOrSymPos(Value value) const {
+    return getDimOrSymPos(value, srcDimPosMap, 0);
+  }
+  unsigned getSymPos(Value value) const {
+    auto it = symbolPosMap.find(value);
+    assert(it != symbolPosMap.end());
+    return numSrcDims + it->second;
+  }
+
+  unsigned getNumSrcDims() const { return numSrcDims; }
+  unsigned getNumDims() const { return numSrcDims; }
+  unsigned getNumSymbols() const { return numSymbols; }
+
+private:
+  bool addValueAt(Value value, DenseMap<Value, unsigned> *posMap,
+                  unsigned position) {
+    auto it = posMap->find(value);
+    if (it == posMap->end()) {
+      (*posMap)[value] = position;
+      return true;
+    }
+    return false;
+  }
+  unsigned getDimOrSymPos(Value value,
+                          const DenseMap<Value, unsigned> &dimPosMap,
+                          unsigned dimPosOffset) const {
+    auto it = dimPosMap.find(value);
+    if (it != dimPosMap.end()) {
+      return dimPosOffset + it->second;
+    }
+    it = symbolPosMap.find(value);
+    assert(it != symbolPosMap.end());
+    return numSrcDims + it->second;
+  }
+
+  unsigned numSrcDims = 0;
+  unsigned numSymbols = 0;
+  DenseMap<Value, unsigned> srcDimPosMap;
+  DenseMap<Value, unsigned> symbolPosMap;
+};
+// Builds a map from Value to identifier position in a new merged identifier
+// list, which is the result of merging dim/symbol lists from src/dst
+// iteration domains, the format of which is as follows:
+//
+//   [src-dim-identifiers, dst-dim-identifiers, symbol-identifiers, const_term]
+//
+// This method populates 'valuePosMap' with mappings from operand Values in
+// 'srcAccessMap'/'dstAccessMap' (as well as those in 'srcDomain'/'dstDomain')
+// to the position of these values in the merged list.
+static void buildDimAndSymbolPositionMaps1(
+    const FlatAffineConstraints &srcDomain,
+    const AffineValueMap &srcAccessMap,
+    ValuePositionMap1 *valuePosMap,
+    FlatAffineConstraints *dependenceConstraints) {
+  auto updateValuePosMap = [&](ArrayRef<Value> values, bool isSrc) {
+    for (unsigned i = 0, e = values.size(); i < e; ++i) {
+      auto value = values[i];
+      if (!isForInductionVar(values[i])) {
+        assert(isValidSymbol(values[i]) &&
+               "access operand has to be either a loop IV or a symbol");
+        valuePosMap->addSymbolValue(value);
+      } else if (isSrc) {
+        valuePosMap->addSrcValue(value);
+      } else {
+				/*nothing*/
       }
     }
+  };
+
+  SmallVector<Value, 4> srcValues;
+  srcDomain.getIdValues(0, srcDomain.getNumDimAndSymbolIds(), &srcValues);
+  // Update value position map with identifiers from src iteration domain.
+  updateValuePosMap(srcValues, /*isSrc=*/true);
+  // Update value position map with identifiers from src access function.
+  updateValuePosMap(srcAccessMap.getOperands(), /*isSrc=*/true);
+}
+
+
+// Sets up dependence constraints columns appropriately, in the format:
+// [src-dim-ids, dst-dim-ids, symbol-ids, local-ids, const_term]
+static void initDependenceConstraints1(
+    const FlatAffineConstraints &srcDomain,
+     const AffineValueMap &srcAccessMap,
+     const ValuePositionMap1 &valuePosMap,
+    FlatAffineConstraints *dependenceConstraints) {
+  // Calculate number of equalities/inequalities and columns required to
+  // initialize FlatAffineConstraints for 'dependenceDomain'.
+  unsigned numIneq = srcDomain.getNumInequalities();// + dstDomain.getNumInequalities();
+  AffineMap srcMap = srcAccessMap.getAffineMap();
+  //assert(srcMap.getNumResults() == dstAccessMap.getAffineMap().getNumResults());
+  unsigned numEq = srcMap.getNumResults();
+  unsigned numDims = srcDomain.getNumDimIds(); 
+  unsigned numSymbols = 0;//valuePosMap.getNumSymbols();
+  unsigned numLocals = 0;//srcDomain.getNumLocalIds();  
+  unsigned numIds = numDims + numSymbols + numLocals;
+  unsigned numCols = numIds + 1;
+
+  // Set flat affine constraints sizes and reserving space for constraints.
+  dependenceConstraints->reset(numIneq, numEq, numCols, numDims, numSymbols, numLocals);
+
+  // Set values corresponding to dependence constraint identifiers.
+  SmallVector<Value, 4> srcLoopIVs;
+  srcDomain.getIdValues(0, srcDomain.getNumDimIds(), &srcLoopIVs);
+
+  dependenceConstraints->setIdValues(0, srcLoopIVs.size(), srcLoopIVs);
+ // dependenceConstraints->setIdValues(srcLoopIVs.size(), srcLoopIVs.size() + dstLoopIVs.size(), dstLoopIVs);
+
+  // Set values for the symbolic identifier dimensions.
+  auto setSymbolIds = [&](ArrayRef<Value> values) {
+    for (auto value : values) {
+      if (!isForInductionVar(value)) {
+        assert(isValidSymbol(value) && "expected symbol");
+        dependenceConstraints->setIdValue(valuePosMap.getSymPos(value), value);
+      }
+    }
+  };
+
+  setSymbolIds(srcAccessMap.getOperands());
+
+  SmallVector<Value, 8> srcSymbolValues;
+  srcDomain.getIdValues(srcDomain.getNumDimIds(), srcDomain.getNumDimAndSymbolIds(), &srcSymbolValues);
+  setSymbolIds(srcSymbolValues);
+
+  for (unsigned i = 0, e = dependenceConstraints->getNumDimAndSymbolIds();
+       i < e; i++)
+    assert(dependenceConstraints->getIds()[i].hasValue());
+}
+
+
+static LogicalResult
+addMemRefAccessConstraints1(const AffineValueMap &srcAccessMap,
+                           const ValuePositionMap1 &valuePosMap,
+                           FlatAffineConstraints *dependenceDomain) {
+  AffineMap srcMap = srcAccessMap.getAffineMap();
+  //assert(srcMap.getNumResults() == dstMap.getNumResults());
+  unsigned numResults = srcMap.getNumResults();
+
+//  unsigned srcNumIds = srcMap.getNumDims() + srcMap.getNumSymbols();
+  ArrayRef<Value> srcOperands = srcAccessMap.getOperands();
+
+  std::vector<SmallVector<int64_t, 8>> srcFlatExprs;
+  FlatAffineConstraints srcLocalVarCst;
+  // Get flattened expressions for the source destination maps.
+  if (failed(getFlattenedAffineExprs(srcMap, &srcFlatExprs, &srcLocalVarCst)))
+    return failure();
+
+//  unsigned domNumLocalIds = dependenceDomain->getNumLocalIds();
+  unsigned srcNumLocalIds = srcLocalVarCst.getNumLocalIds();
+  unsigned numLocalIdsToAdd = srcNumLocalIds;
+  for (unsigned i = 0; i < numLocalIdsToAdd; i++) {
+    dependenceDomain->addLocalId(dependenceDomain->getNumLocalIds());
   }
+
+//  unsigned numDims = dependenceDomain->getNumDimIds();
+//  unsigned numSymbols = dependenceDomain->getNumSymbolIds();
+//  unsigned numSrcLocalIds = srcLocalVarCst.getNumLocalIds();
+//  unsigned newLocalIdOffset = numDims + numSymbols + domNumLocalIds;
+
+  // Equality to add.
+  SmallVector<int64_t, 8> eq(dependenceDomain->getNumCols());
+  for (unsigned i = 0; i < numResults; ++i) {
+    // Zero fill.
+    std::fill(eq.begin(), eq.end(), 0);
+
+    // Flattened AffineExpr for src result 'i'.
+    const auto &srcFlatExpr = srcFlatExprs[i];
+    // Set identifier coefficients from src access function.
+    for (unsigned j = 0, e = srcOperands.size(); j < e; ++j)
+      eq[valuePosMap.getSrcDimOrSymPos(srcOperands[j])] = srcFlatExpr[j];
+    // Local terms.
+  /*  for (unsigned j = 0, e = srcNumLocalIds; j < e; j++)
+      eq[newLocalIdOffset + j] = srcFlatExpr[srcNumIds + j];*/
+    // Set constant term.
+    eq[eq.size() - 1] = srcFlatExpr[srcFlatExpr.size() - 1];
+
+    // Add equality constraint.
+    dependenceDomain->addEquality(eq);
+	cout<<"printing eq"<<endl;
+	for(auto i:eq)
+	{
+		cout<<i<<" ";
+	}
+	cout<<endl;
+  }
+
+
+
+/*  // Add equality constraints for any operands that are defined by constant ops.
+  auto addEqForConstOperands = [&](ArrayRef<Value> operands) {
+    for (unsigned i = 0, e = operands.size(); i < e; ++i) {
+      if (isForInductionVar(operands[i]))
+        continue;
+      auto symbol = operands[i];
+      assert(isValidSymbol(symbol));
+      // Check if the symbol is a constant.
+      if (auto cOp = dyn_cast_or_null<ConstantIndexOp>(symbol.getDefiningOp()))
+        dependenceDomain->setIdToConstant(valuePosMap.getSymPos(symbol),
+                                          cOp.getValue());
+    }
+  };
+
+  // Add equality constraints for any src symbols defined by constant ops.
+  addEqForConstOperands(srcOperands);*/
+
+  // By construction (see flattener), local var constraints will not have any
+  // equalities.
+/*  assert(srcLocalVarCst.getNumEqualities() == 0);
+
+  // Add inequalities from srcLocalVarCst and destLocalVarCst into the
+  // dependence domain.
+  SmallVector<int64_t, 8> ineq(dependenceDomain->getNumCols());
+  for (unsigned r = 0, e = srcLocalVarCst.getNumInequalities(); r < e; r++) {
+    std::fill(ineq.begin(), ineq.end(), 0);
+
+    // Set identifier coefficients from src local var constraints.
+    for (unsigned j = 0, e = srcOperands.size(); j < e; ++j)
+      ineq[valuePosMap.getSrcDimOrSymPos(srcOperands[j])] =
+          srcLocalVarCst.atIneq(r, j);
+    // Local terms.
+    for (unsigned j = 0, e = srcNumLocalIds; j < e; j++)
+      ineq[newLocalIdOffset + j] = srcLocalVarCst.atIneq(r, srcNumIds + j);
+    // Set constant term.
+    ineq[ineq.size() - 1] =
+        srcLocalVarCst.atIneq(r, srcLocalVarCst.getNumCols() - 1);
+    dependenceDomain->addInequality(ineq);
+  }*/
+
+  return success();
 }
 
 // Walks the Function 'f' adding load and store ops to 'loadsAndStores'.
@@ -114,63 +355,60 @@ void TestMemRefDependenceCheck1::runOnFunction() {
 		forOps.push_back(op);
   });
 
-/*	std::cout << "no of load stores: "<< loadsAndStores.size()<<endl;
-   std::cout<<"no of for: " <<forOps.size()<<endl;
+	for(int k=0;k<loadsAndStores.size();k++)
+{
+	FlatAffineConstraints dependenceConstraints;
+	
+	cout<<"load store : "<<k<<endl;
+	loadsAndStores[k]->dump();
+	cout<<"-----------------------------------------"<<endl;	
 
-	forOps[0]->dump();
-	forOps[1]->dump();
-
-	OperationName on = forOps[1]->getName();
-	cout<<"operation name"<<on.getStringRef().str();
-
-	AffineForOp  foro(forOps[1]);
-
-	AffineBound lb = foro.getUpperBound();
-	cout<<endl<<"lower bound "<<endl;
-	cout<<lb.getMap().getSingleConstantResult();*/
-
-
-/*	AffineLoadOp lo(loadsAndStores[0]);
-
-	cout<<"operand: ";
-	lo.getOperand(0);
-	cout<<"--------"<<endl;
-
-	lo.getAffineMap().dump();
-
-	lo.getMemRefType().dump();
-
-	MemRefAccess lomemref(lo);
-
-
-
-	AffineValueMap srcAccessMap;
-   lomemref.getAccessMap(&srcAccessMap);
-
-	cout<<"------------------------"<<endl;
-	srcAccessMap.getOperand(0).dump();
-	srcAccessMap.getOperand(1).dump();
-
-	cout<<endl;*/
-
-//	checkMemrefAccessDependence((
-  //  const MemRefAccess &srcAccess, const MemRefAccess &dstAccess,
-  //  unsigned loopDepth, FlatAffineConstraints *dependenceConstraints,
-  //  SmallVector<DependenceComponent, 2> *dependenceComponents, bool allowRAR)
-
-	auto *srcOpInst = loadsAndStores[0];
-	loadsAndStores[0]->dump();
+	auto *srcOpInst = loadsAndStores[k];
    MemRefAccess srcAccess(srcOpInst);
-   auto *dstOpInst = loadsAndStores[1];
+
+  // Get composed access function for 'srcAccess'.
+   AffineValueMap srcAccessMap;
+   srcAccess.getAccessMap(&srcAccessMap);
+
+  // Get iteration domain for the 'srcAccess' operation.
+  FlatAffineConstraints srcDomain;
+  if (failed(getInstIndexSet(srcAccess.opInst, &srcDomain))) ; 
+    // return DependenceResult::Failure;
+
+  // Build dim and symbol position maps for each access from access operand
+  // Value to position in merged constraint system.
+  ValuePositionMap1 valuePosMap;
+ 
+	buildDimAndSymbolPositionMaps1(srcDomain, srcAccessMap, &valuePosMap, &dependenceConstraints);
+  initDependenceConstraints1(srcDomain, srcAccessMap, valuePosMap, &dependenceConstraints);
+
+//  assert(valuePosMap.getNumDims() ==
+  //       srcDomain.getNumDimIds() + dstDomain.getNumDimIds());
+
+  // Create memref access constraint by equating src/dst access functions.
+  // Note that this check is conservative, and will fail in the future when
+  // local variables for mod/div exprs are supported.
+  if (failed(addMemRefAccessConstraints1(srcAccessMap, valuePosMap, &dependenceConstraints)));
+ //   return DependenceResult::Failure;
+
+
+	dependenceConstraints.dump();
+
+	cout<<"***************************************************"<<endl;	
+}
+
+/*	auto *srcOpInst = loadsAndStores[0];
+   MemRefAccess srcAccess(srcOpInst);
+
+  auto *dstOpInst = loadsAndStores[1];
 	loadsAndStores[1]->dump();
    MemRefAccess dstAccess(dstOpInst);
 
-   FlatAffineConstraints dependenceConstraints;
    SmallVector<DependenceComponent, 2> depComps;
-	int d = 2;
-        // TODO(andydavis,bondhugula) Explore whether it would be profitable
-        // to pre-compute and store deps instead of repeatedly checking.
-   DependenceResult result = checkMemrefAccessDependence(srcAccess, dstAccess, d, &dependenceConstraints, &depComps);
+	int d=2;
+   DependenceResult result = checkMemrefAccessDependence(srcAccess, dstAccess, d, &dependenceConstraints, &depComps);*/
+
+	
    
 
  // checkDependences(loadsAndStores);
@@ -183,3 +421,4 @@ void registerTestMemRefDependenceCheck1() {
       "Find most efficient loop permutation.");
 }
 } // namespace mlir
+
