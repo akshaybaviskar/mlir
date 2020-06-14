@@ -55,6 +55,7 @@ void registerTestLoopFusion();
 void registerTestLoopMappingPass();
 void registerTestMatchers();
 void registerTestMemRefDependenceCheck();
+void registerAffineLoopInterchange();
 void registerTestMemRefStrideCalculation();
 void registerTestOpaqueLoc();
 void registerTestParallelismDetection();
@@ -121,6 +122,7 @@ void registerTestPasses() {
   registerTestLoopMappingPass();
   registerTestMatchers();
   registerTestMemRefDependenceCheck();
+  registerAffineLoopInterchange();
   registerTestMemRefStrideCalculation();
   registerTestOpaqueLoc();
   registerTestParallelismDetection();

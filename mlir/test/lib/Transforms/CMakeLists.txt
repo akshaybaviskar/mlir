@@ -16,6 +16,7 @@ add_llvm_library(MLIRTestTransforms
   TestOpaqueLoc.cpp
   TestMemRefBoundCheck.cpp
   TestMemRefDependenceCheck.cpp
+  TestAffineLoopInterchange.cpp
   TestMemRefStrideCalculation.cpp
   TestVectorToLoopsConversion.cpp
   TestVectorTransforms.cpp
