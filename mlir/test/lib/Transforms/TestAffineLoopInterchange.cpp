@@ -201,6 +201,7 @@ struct AffineLoopInterchange
   void runOnFunction() override;
 
   vector<vector<int>> accfunmatch;
+  vector<pair<vector<int>, vector<vector<int>>>> group_list;
   unordered_map<int, bool> parallel_loops;
   vector<pair<unsigned long, vector<int>>> PermMisses;
   vector<vector<int>> spatreuse;
@@ -251,10 +252,28 @@ struct AffineLoopInterchange
     }
 
     // TODO : add stride information and read 2048 from loop information
-    unsigned long cacheMisses(vector<int> perm) {
+    unsigned long cacheMisses(vector<int> perm, AffineForOp& forOp) {
       unsigned long misses = 1;
       int power = 0;
       int div = 0;
+
+
+    SmallVector<AffineForOp, 4> loops;
+    getPerfectlyNestedLoops(loops, forOp);
+
+	 SmallVector<unsigned, 4> tripcount(loops.size());
+	 SmallVector<unsigned, 4> stride(loops.size());
+
+	for(unsigned long i=0;i<loops.size();i++)
+	{
+		int64_t ub = loops[perm[i]].getConstantUpperBound();
+		int64_t lb = loops[perm[i]].getConstantLowerBound();
+
+		int64_t step = loops[perm[i]].getStep();
+
+		tripcount[i] = ((ub - 1) - lb + step)/step;
+		stride[i] = step;
+	}
 
       int pivotfound = 0;
       for (int i = perm.size() - 1; i >= 0; i--) {
@@ -280,21 +299,37 @@ struct AffineLoopInterchange
         if (allZero) {
           if (AccessFun[row][col] == 0) {
             continue;
-          } else if (abs(AccessFun[row][col]) < CACHE_LINE_SIZE) {
-            div = CACHE_LINE_SIZE / abs(AccessFun[row][col]);
+          } else if ((abs(AccessFun[row][col])*stride[col]) < CACHE_LINE_SIZE) {
+            div = CACHE_LINE_SIZE * abs(AccessFun[row][col]) * stride[col];
             pivotfound = 1;
             power++;
           }
+			 else
+			 {
+				pivotfound = 1;
+				power++;
+			}
         }
       }
 
-      //	cout<<"(n^"<<power<<")";
+	/*	cout<<endl;
+		cout<<"perm : ";
+		for(auto i: perm)
+		{
+			cout<<i;
+		}
+		cout<<endl;
+		op->dump();
+      	cout<<"(";*/
       for (int i = 0; i < power; i++) {
-        misses = misses * 2048;
+        misses = misses * tripcount[i];
+      //	cout<<"*"<<tripcount[i];
       }
+      //	cout<<")";
+      //	cout<<"(n^"<<power<<")";
       if (div) {
         misses = misses / div;
-        //	cout<<"/"<<div<<endl;
+      //  	cout<<"/"<<div<<endl;
       }
 
       return misses;
@@ -424,6 +459,68 @@ struct AffineLoopInterchange
       }
     }
 
+	 int allSame = 1;
+	 for (unsigned int i = 0; i < PermMisses.size(); i++) {
+      if (PermMisses[i].first != last)
+		{
+		  allSame = 0;
+        break;
+		}
+    }
+
+	 if((allSame) &&(group_list.size() !=0))
+	 {
+		vector<vector<int>> last_grp(group_list[0].second);
+      for(unsigned int i = 0;i<group_list.size();i++)
+		{
+			//total no of groups for each permutation
+			if(group_list[i].second.size() != last_grp.size())
+			{
+				allSame = 0;
+				break;
+			}
+			//each group 
+			for(unsigned int j=0;j<group_list[i].second.size();j++)
+			{
+				if(group_list[i].second[j].size() != last_grp[j].size())
+				{
+					allSame = 0;
+					break;
+				}
+				for(unsigned int k=0;k<group_list[i].second[j].size();k++)
+				{
+					if(group_list[i].second[j][k] != last_grp[j][k])
+					{
+						allSame = 0;
+						break;
+					}
+				}
+			}
+		}
+	 }
+
+	 if(allSame)
+	 {
+		double max = 0;
+      int maxid = 0;
+	   unsigned long total_cost = PermMisses[0].first;
+
+		for(unsigned int i=0;i<group_misses.size();i++)
+		{
+			double sum = 0;
+			for(unsigned int j = 0;j<group_misses[i].second.size();j++)
+			{
+				sum += group_list[i].second[j].size() *(1 - (double)group_misses[i].second[j]/total_cost); 
+			}
+			if(sum>max)
+			{
+				max = sum;
+				maxid = i;
+			}
+		}
+	   best = maxid;	
+	}
+
     std::vector<unsigned int> permMap(PermMisses[best].second.size());
     for (unsigned inx = 0; inx < PermMisses[best].second.size(); ++inx) {
       permMap[PermMisses[best].second[inx]] = inx;
@@ -531,7 +628,8 @@ struct AffineLoopInterchange
 
   // Group all the load/stores if they exist either spatial or temporal locality for given permutation.
   // and estimate total cache misses after grouping. 
-  void find_access_groups(vector<int> perm) {
+  vector<pair<vector<int>,vector<unsigned long>>> group_misses;
+  void find_access_groups(vector<int> perm, AffineForOp& forOp) {
     vector<vector<int>> groups;
     vector<int> visited(ls_vector.size());
 
@@ -558,11 +656,16 @@ struct AffineLoopInterchange
     }
 
     // calcualte total misses for this permutation
+	 vector<unsigned long> miss_vector;
     unsigned long misses = 0;
     for (auto i : groups) {
-      misses += ls_vector[i[0]].cacheMisses(perm);
+		unsigned long miss = ls_vector[i[0]].cacheMisses(perm, forOp);
+      misses += miss;
+		miss_vector.push_back(miss);
     }
 
+    group_misses.push_back(make_pair(perm,miss_vector)); 
+	 group_list.push_back(make_pair(perm, groups));
     PermMisses.push_back(make_pair(misses, perm));
   }
 
@@ -639,6 +742,13 @@ struct AffineLoopInterchange
         return false;
       }
     }
+
+	//bailout non-rectangular loops
+	for(unsigned long i=0;i<loops.size();i++)
+	{
+		if(!loops[i].hasConstantLowerBound() || !loops[i].hasConstantUpperBound())
+			return false;
+	}
     return true;
   }
 
@@ -741,7 +851,7 @@ void AffineLoopInterchange::runOnFunction() {
 			 //calculate cache misses for each permutation
           for (int i = 0; i < total_perm; i++) {
             if (isValidPerm(perm)) {
-              find_access_groups(perm);
+              find_access_groups(perm, forOp);
             }
             next_permutation(perm.begin(), perm.end());
           }
