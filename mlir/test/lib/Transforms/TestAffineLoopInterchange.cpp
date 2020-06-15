@@ -111,8 +111,7 @@ initDependenceConstraints(const FlatAffineConstraints &srcDomain,
                           FlatAffineConstraints *dependenceConstraints) {
   // Calculate number of equalities/inequalities and columns required to
   // initialize FlatAffineConstraints for 'dependenceDomain'.
-  unsigned numIneq =
-      srcDomain.getNumInequalities();
+  unsigned numIneq = srcDomain.getNumInequalities();
   AffineMap srcMap = srcAccessMap.getAffineMap();
   unsigned numEq = srcMap.getNumResults();
   unsigned numDims = srcDomain.getNumDimIds();
@@ -251,29 +250,26 @@ struct AffineLoopInterchange
       }
     }
 
-    // TODO : add stride information and read 2048 from loop information
-    unsigned long cacheMisses(vector<int> perm, AffineForOp& forOp) {
+    unsigned long cacheMisses(vector<int> perm, AffineForOp &forOp) {
       unsigned long misses = 1;
       int power = 0;
       int div = 0;
 
+      SmallVector<AffineForOp, 4> loops;
+      getPerfectlyNestedLoops(loops, forOp);
 
-    SmallVector<AffineForOp, 4> loops;
-    getPerfectlyNestedLoops(loops, forOp);
+      SmallVector<unsigned, 4> tripcount(loops.size());
+      SmallVector<unsigned, 4> stride(loops.size());
 
-	 SmallVector<unsigned, 4> tripcount(loops.size());
-	 SmallVector<unsigned, 4> stride(loops.size());
+      for (unsigned long i = 0; i < loops.size(); i++) {
+        int64_t ub = loops[perm[i]].getConstantUpperBound();
+        int64_t lb = loops[perm[i]].getConstantLowerBound();
 
-	for(unsigned long i=0;i<loops.size();i++)
-	{
-		int64_t ub = loops[perm[i]].getConstantUpperBound();
-		int64_t lb = loops[perm[i]].getConstantLowerBound();
+        int64_t step = loops[perm[i]].getStep();
 
-		int64_t step = loops[perm[i]].getStep();
-
-		tripcount[i] = ((ub - 1) - lb + step)/step;
-		stride[i] = step;
-	}
+        tripcount[i] = ((ub - 1) - lb + step) / step;
+        stride[i] = step;
+      }
 
       int pivotfound = 0;
       for (int i = perm.size() - 1; i >= 0; i--) {
@@ -299,37 +295,23 @@ struct AffineLoopInterchange
         if (allZero) {
           if (AccessFun[row][col] == 0) {
             continue;
-          } else if ((abs(AccessFun[row][col])*stride[col]) < CACHE_LINE_SIZE) {
+          } else if ((abs(AccessFun[row][col]) * stride[col]) <
+                     CACHE_LINE_SIZE) {
             div = CACHE_LINE_SIZE * abs(AccessFun[row][col]) * stride[col];
             pivotfound = 1;
             power++;
+          } else {
+            pivotfound = 1;
+            power++;
           }
-			 else
-			 {
-				pivotfound = 1;
-				power++;
-			}
         }
       }
 
-	/*	cout<<endl;
-		cout<<"perm : ";
-		for(auto i: perm)
-		{
-			cout<<i;
-		}
-		cout<<endl;
-		op->dump();
-      	cout<<"(";*/
       for (int i = 0; i < power; i++) {
         misses = misses * tripcount[i];
-      //	cout<<"*"<<tripcount[i];
       }
-      //	cout<<")";
-      //	cout<<"(n^"<<power<<")";
       if (div) {
         misses = misses / div;
-      //  	cout<<"/"<<div<<endl;
       }
 
       return misses;
@@ -338,14 +320,17 @@ struct AffineLoopInterchange
 
   int factorial(int n) { return (n == 1 || n == 0) ? 1 : n * factorial(n - 1); }
 
-  //find dependences between all pairs of load/store operatio and convert them to a direction vector.
-  // Also find if two accesses have temporal group locality. Here, two operations are considered to 
-  // have temporal group locality if they access to same element in two different iterations within 
-  // the innermost loop of forloop nest.
-  // e.g. A[i-1][j][k] and A[i][j][k] will have temporal group locality when i is the innermost loop in 
-  // for loopnest otherwise not. Since two consecutive iterations will be accessing the same element.
-  // matrix tempreuse[i][j] stores the temporal group reuse information. It is set to -1 if no reuse exist.
-  // If group reuse exist then it stores the innermost loop id for which temp reuse exist.
+  // find dependences between all pairs of load/store operatio and convert them
+  // to a direction vector.
+  // Also find if two accesses have temporal group locality. Here, two
+  // operations are considered to have temporal group locality if they access to
+  // same element in two different iterations within the innermost loop of
+  // forloop nest. e.g. A[i-1][j][k] and A[i][j][k] will have temporal group
+  // locality when i is the innermost loop in for loopnest otherwise not. Since
+  // two consecutive iterations will be accessing the same element. matrix
+  // tempreuse[i][j] stores the temporal group reuse information. It is set to
+  // -1 if no reuse exist. If group reuse exist then it stores the innermost
+  // loop id for which temp reuse exist.
   void calculateDependences() {
     tempreuse =
         vector<vector<int>>(ls_vector.size(), vector<int>(ls_vector.size()));
@@ -444,8 +429,8 @@ struct AffineLoopInterchange
   }
 
   // the permutation with least cache misses is selected as best permutation
-  // if more than two permutation have same cache misses then the permutation which 
-  // can have outer parallelism is selected as the best permutation
+  // if more than two permutation have same cache misses then the permutation
+  // which can have outer parallelism is selected as the best permutation
   vector<unsigned> find_best_perm() {
     sort(PermMisses.begin(), PermMisses.end());
     unsigned long last = PermMisses[0].first;
@@ -459,67 +444,56 @@ struct AffineLoopInterchange
       }
     }
 
-	 int allSame = 1;
-	 for (unsigned int i = 0; i < PermMisses.size(); i++) {
-      if (PermMisses[i].first != last)
-		{
-		  allSame = 0;
+    int allSame = 1;
+    for (unsigned int i = 0; i < PermMisses.size(); i++) {
+      if (PermMisses[i].first != last) {
+        allSame = 0;
         break;
-		}
+      }
     }
 
-	 if((allSame) &&(group_list.size() !=0))
-	 {
-		vector<vector<int>> last_grp(group_list[0].second);
-      for(unsigned int i = 0;i<group_list.size();i++)
-		{
-			//total no of groups for each permutation
-			if(group_list[i].second.size() != last_grp.size())
-			{
-				allSame = 0;
-				break;
-			}
-			//each group 
-			for(unsigned int j=0;j<group_list[i].second.size();j++)
-			{
-				if(group_list[i].second[j].size() != last_grp[j].size())
-				{
-					allSame = 0;
-					break;
-				}
-				for(unsigned int k=0;k<group_list[i].second[j].size();k++)
-				{
-					if(group_list[i].second[j][k] != last_grp[j][k])
-					{
-						allSame = 0;
-						break;
-					}
-				}
-			}
-		}
-	 }
+    if ((allSame) && (group_list.size() != 0)) {
+      vector<vector<int>> last_grp(group_list[0].second);
+      for (unsigned int i = 0; i < group_list.size(); i++) {
+        // total no of groups for each permutation
+        if (group_list[i].second.size() != last_grp.size()) {
+          allSame = 0;
+          break;
+        }
+        // each group
+        for (unsigned int j = 0; j < group_list[i].second.size(); j++) {
+          if (group_list[i].second[j].size() != last_grp[j].size()) {
+            allSame = 0;
+            break;
+          }
+          for (unsigned int k = 0; k < group_list[i].second[j].size(); k++) {
+            if (group_list[i].second[j][k] != last_grp[j][k]) {
+              allSame = 0;
+              break;
+            }
+          }
+        }
+      }
+    }
 
-	 if(allSame)
-	 {
-		double max = 0;
+    if (allSame) {
+      double max = 0;
       int maxid = 0;
-	   unsigned long total_cost = PermMisses[0].first;
+      unsigned long total_cost = PermMisses[0].first;
 
-		for(unsigned int i=0;i<group_misses.size();i++)
-		{
-			double sum = 0;
-			for(unsigned int j = 0;j<group_misses[i].second.size();j++)
-			{
-				sum += group_list[i].second[j].size() *(1 - (double)group_misses[i].second[j]/total_cost); 
-			}
-			if(sum>max)
-			{
-				max = sum;
-				maxid = i;
-			}
-		}
-	   best = maxid;	
-	}
+      for (unsigned int i = 0; i < group_misses.size(); i++) {
+        double sum = 0;
+        for (unsigned int j = 0; j < group_misses[i].second.size(); j++) {
+          sum += group_list[i].second[j].size() *
+                 (1 - (double)group_misses[i].second[j] / total_cost);
+        }
+        if (sum > max) {
+          max = sum;
+          maxid = i;
+        }
+      }
+      best = maxid;
+    }
 
     std::vector<unsigned int> permMap(PermMisses[best].second.size());
     for (unsigned inx = 0; inx < PermMisses[best].second.size(); ++inx) {
@@ -543,9 +517,10 @@ struct AffineLoopInterchange
     return true;
   }
 
-  // creates a matrix accfunmatch of size nxn where n is the number of load/store operations in the for loopnest.
-  // accfunmatch[i][j] is 1 if operation i and j refer to same argument and have same access function
-  // else it is 0
+  // creates a matrix accfunmatch of size nxn where n is the number of
+  // load/store operations in the for loopnest. accfunmatch[i][j] is 1 if
+  // operation i and j refer to same argument and have same access function else
+  // it is 0
   void find_same_acc_fun() {
     accfunmatch =
         vector<vector<int>>(ls_vector.size(), vector<int>(ls_vector.size()));
@@ -583,12 +558,15 @@ struct AffineLoopInterchange
     }
   }
 
-  // creates a matrix spatreuse of size nxn where n is the number of load/store operations in the for loopnest.
-  // spatreuse[i][j] is 1 if accfunmatch[i][j] = 1 AND all the dimensions of the two operations are same except last dimension
-  // and last dimension differ by maximum CACHE_LINE_SIZE for two operations.
-  // e.g. Assume CACHE_LINE_SIZE to be 8.
-  //  A[i-1][j][k] and A[i-1][j][k+6] will have spatial reuse since both the elements are highly likely to lie in same cache line
-  // while A[i][j][k] and A[i][j][k+8] won't lie in same cache line and thus for such a pair spatreuse is set to 0.
+  // creates a matrix spatreuse of size nxn where n is the number of load/store
+  // operations in the for loopnest. spatreuse[i][j] is 1 if accfunmatch[i][j] =
+  // 1 AND all the dimensions of the two operations are same except last
+  // dimension and last dimension differ by maximum CACHE_LINE_SIZE for two
+  // operations. e.g. Assume CACHE_LINE_SIZE to be 8.
+  //  A[i-1][j][k] and A[i-1][j][k+6] will have spatial reuse since both the
+  //  elements are highly likely to lie in same cache line
+  // while A[i][j][k] and A[i][j][k+8] won't lie in same cache line and thus for
+  // such a pair spatreuse is set to 0.
   void find_spatial_groups() {
     spatreuse =
         vector<vector<int>>(ls_vector.size(), vector<int>(ls_vector.size()));
@@ -626,10 +604,10 @@ struct AffineLoopInterchange
     }
   }
 
-  // Group all the load/stores if they exist either spatial or temporal locality for given permutation.
-  // and estimate total cache misses after grouping. 
-  vector<pair<vector<int>,vector<unsigned long>>> group_misses;
-  void find_access_groups(vector<int> perm, AffineForOp& forOp) {
+  // Group all the load/stores if they exist either spatial or temporal locality
+  // for given permutation. and estimate total cache misses after grouping.
+  vector<pair<vector<int>, vector<unsigned long>>> group_misses;
+  void find_access_groups(vector<int> perm, AffineForOp &forOp) {
     vector<vector<int>> groups;
     vector<int> visited(ls_vector.size());
 
@@ -656,16 +634,16 @@ struct AffineLoopInterchange
     }
 
     // calcualte total misses for this permutation
-	 vector<unsigned long> miss_vector;
+    vector<unsigned long> miss_vector;
     unsigned long misses = 0;
     for (auto i : groups) {
-		unsigned long miss = ls_vector[i[0]].cacheMisses(perm, forOp);
+      unsigned long miss = ls_vector[i[0]].cacheMisses(perm, forOp);
       misses += miss;
-		miss_vector.push_back(miss);
+      miss_vector.push_back(miss);
     }
 
-    group_misses.push_back(make_pair(perm,miss_vector)); 
-	 group_list.push_back(make_pair(perm, groups));
+    group_misses.push_back(make_pair(perm, miss_vector));
+    group_list.push_back(make_pair(perm, groups));
     PermMisses.push_back(make_pair(misses, perm));
   }
 
@@ -676,11 +654,11 @@ struct AffineLoopInterchange
     bool isPerfect;
   } LoopNode;
 
-	//Takes input as outermost for loop of the for loop nest.
-   //And builds tree with inner for loops as children and outermost for loop as root of the tree.
-	//Along with that for every node stores the information if that loopnest is perfect.
-	//if it is imperfect then finds if it is convertible to perfect.
-	//Returns the root of the tree.
+  // Takes input as outermost for loop of the for loop nest.
+  // And builds tree with inner for loops as children and outermost for loop as
+  // root of the tree. Along with that for every node stores the information if
+  // that loopnest is perfect. if it is imperfect then finds if it is convertible
+  // to perfect. Returns the root of the tree.
   LoopNode *BuildTree(AffineForOp &root) {
     LoopNode *loopnode = new LoopNode();
     getPerfectlyNestedLoops(loopnode->loops, root);
@@ -705,13 +683,13 @@ struct AffineLoopInterchange
         break;
       }
 
-		// if contains load/store then not convertible
+      // if contains load/store then not convertible
       if (isa<AffineLoadOp>(op) || isa<AffineStoreOp>(op)) {
         loopnode->isConvertible = false;
       }
     }
 
-	//recursive call to build subtrees for it's children for loops
+    // recursive call to build subtrees for it's children for loops
     if ((loopnode->isPerfect == false) && loopnode->isConvertible) {
       for (auto &op : *block) {
         if (auto forOp = dyn_cast<AffineForOp>(op)) {
@@ -725,7 +703,8 @@ struct AffineLoopInterchange
     return loopnode;
   }
 
-  //Takes input as outermost ForOp of for loopnest and tells if it is a perfect nest.
+  // Takes input as outermost ForOp of for loopnest and tells if it is a perfect
+  // nest.
   bool isPerfect(AffineForOp &root) {
     SmallVector<AffineForOp, 4> loops;
     getPerfectlyNestedLoops(loops, root);
@@ -743,16 +722,16 @@ struct AffineLoopInterchange
       }
     }
 
-	//bailout non-rectangular loops
-	for(unsigned long i=0;i<loops.size();i++)
-	{
-		if(!loops[i].hasConstantLowerBound() || !loops[i].hasConstantUpperBound())
-			return false;
-	}
+    // bailout non-rectangular loops
+    for (unsigned long i = 0; i < loops.size(); i++) {
+      if (!loops[i].hasConstantLowerBound() ||
+          !loops[i].hasConstantUpperBound())
+        return false;
+    }
     return true;
   }
 
-  //Convert the imperfect loops to perfect by traversing the looptree
+  // Convert the imperfect loops to perfect by traversing the looptree
   void makePerfect(LoopNode *root, AffineForOp &op, int child) {
     AffineForOp newLoop = op;
 
@@ -796,9 +775,9 @@ struct AffineLoopInterchange
 
 void AffineLoopInterchange::runOnFunction() {
 
-  vector<LoopNode*> looptree;
+  vector<LoopNode *> looptree;
 
-  // Build ForOp n-ary tree for each forloop nest 
+  // Build ForOp n-ary tree for each forloop nest
   for (auto &block : getFunction()) {
     for (auto &op : block) {
       if (auto forOp = dyn_cast<AffineForOp>(op)) {
@@ -810,7 +789,8 @@ void AffineLoopInterchange::runOnFunction() {
     }
   }
 
-  // Iterate over all the looptrees and convert all the convertible imperefect loops into perfect loops by fission
+  // Iterate over all the looptrees and convert all the convertible imperefect
+  // loops into perfect loops by fission
   for (auto i : looptree) {
     if (!(i->isPerfect) && (i->isConvertible)) {
       makePerfect(i, i->loops[0], -1);
@@ -824,19 +804,20 @@ void AffineLoopInterchange::runOnFunction() {
       if (auto forOp = dyn_cast<AffineForOp>(op)) {
         if (isPerfect(forOp)) {
 
-			 //Calculate access function for each load/store operation
+          // Calculate access function for each load/store operation
           forOp.walk([&](Operation *op) {
             if (isa<AffineLoadOp>(op) || isa<AffineStoreOp>(op))
               ls_vector.push_back(LoadStoreInfo(op));
           });
 
-			 //find all the load/store operations which has same access function
+          // find all the load/store operations which has same access function
           find_same_acc_fun();
 
-			 //find all the load/store operations which exhibit spatial locality in same iteration
+          // find all the load/store operations which exhibit spatial locality
+          // in same iteration
           find_spatial_groups();
 
-			 //calculate dependences between all pairs of load/store ops
+          // calculate dependences between all pairs of load/store ops
           calculateDependences();
 
           // find total possible permutations
@@ -848,7 +829,7 @@ void AffineLoopInterchange::runOnFunction() {
             perm.push_back(i);
           }
 
-			 //calculate cache misses for each permutation
+          // calculate cache misses for each permutation
           for (int i = 0; i < total_perm; i++) {
             if (isValidPerm(perm)) {
               find_access_groups(perm, forOp);
@@ -859,7 +840,7 @@ void AffineLoopInterchange::runOnFunction() {
           // find iterations which can be executed parallely
           find_par_loops();
 
-          // find best permutation 
+          // find best permutation
           BestPerm.push_back(make_pair(forOp, find_best_perm()));
 
           ls_vector.clear();
@@ -874,7 +855,8 @@ void AffineLoopInterchange::runOnFunction() {
     }
   }
 
-  //perform the interchange as per best perumtation for all the forloop nests in the function.
+  // perform the interchange as per best perumtation for all the forloop nests
+  // in the function.
   for (auto i : BestPerm) {
     SmallVector<AffineForOp, 4> l;
     getPerfectlyNestedLoops(l, i.first);
